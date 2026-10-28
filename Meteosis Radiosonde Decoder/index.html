@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MTS-01 Radiosonde Takip</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --bg:#f5f6f8; --fg:#1d2330; --card:#fff; --muted:#667; --accent:#1f6feb; --ok:#1a7f37; --bad:#b42318; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.4 system-ui,Segoe UI,Arial,sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:10px 14px; background:#14213d; color:#fff; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; font-weight:600; }
+  .wrap { display:grid; grid-template-columns: 330px 1fr; gap:12px; padding:12px; height: calc(100vh - 52px); }
+  @media (max-width: 860px) { .wrap { grid-template-columns:1fr; height:auto; } #map { height:60vh; } }
+  .panel { background:var(--card); border-radius:10px; padding:12px; box-shadow:0 1px 3px rgba(0,0,0,.08); overflow:auto; }
+  .panel h2 { font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin:14px 0 6px; }
+  label { display:block; font-size:12px; color:var(--muted); margin-top:8px; }
+  select, input[type=file] { width:100%; padding:7px; border:1px solid #ccd; border-radius:6px; font-size:13px; background:#fff; }
+  button { padding:8px 12px; border:0; border-radius:6px; background:var(--accent); color:#fff; font-size:13px; cursor:pointer; margin-top:8px; }
+  button.secondary { background:#e6e9f0; color:var(--fg); }
+  button.stop { background:var(--bad); }
+  button:disabled { opacity:.45; cursor:default; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  .kv { display:grid; grid-template-columns: 110px 1fr; gap:4px 8px; font-size:13px; margin-top:6px; }
+  .kv div:nth-child(odd) { color:var(--muted); }
+  .meter { height:10px; background:#e6e9f0; border-radius:5px; overflow:hidden; margin-top:4px; }
+  .meter > div { height:100%; width:0%; background:var(--ok); transition: width .15s; }
+  .status-dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:#999; margin-right:6px; }
+  .status-dot.on { background:var(--ok); }
+  #map { border-radius:10px; min-height:300px; height:100%; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+  table { width:100%; border-collapse:collapse; font-size:12px; margin-top:6px; }
+  th, td { text-align:left; padding:4px 5px; border-bottom:1px solid #eee; }
+  th { color:var(--muted); font-weight:500; }
+  tr.latest td { background:#eef5ff; }
+  .small { font-size:12px; color:var(--muted); }
+  code { background:#f0f2f6; padding:1px 4px; border-radius:4px; font-size:12px; }
+  .log { font:11px/1.35 Consolas,monospace; color:#333; max-height:140px; overflow:auto; background:#f7f8fa; padding:6px; border-radius:6px; white-space:pre-wrap; word-break:break-all; }
+</style>
+</head>
+<body>
+<header>
+  <span class="status-dot" id="dot"></span>
+  <h1>Meteosis MTS-01 Radyosonde Takip</h1>
+  <span class="small" style="color:#cfd8e3" id="hdrStatus">Hazır değil</span>
+</header>
+
+<div class="wrap">
+  <div class="panel">
+    <h2>1 · Ses girişi</h2>
+    <div class="small">SDR# çıkışını bir sanal ses kablosuna (VB-Cable) yönlendirin. Tarayıcıda o kablonun <b>Output</b> tarafını seçin.</div>
+    <button class="secondary" id="btnPerm">Mikrofon izni ver / cihazları listele</button>
+    <label for="devSel">Giriş cihazı</label>
+    <select id="devSel"><option value="">— önce izin verin —</option></select>
+    <div class="row">
+      <button id="btnStart" disabled>Dinlemeyi başlat</button>
+      <button id="btnStop" class="stop" disabled>Durdur</button>
+    </div>
+
+    <h2>2 · Test (isteğe bağlı)</h2>
+    <div class="small">SDR# olmadan kayıtlı bir ses dosyasıyla deneyin (mono/stereo WAV, kanal 1 kullanılır).</div>
+    <input type="file" id="fileIn" accept=".wav,audio/wav">
+
+    <h2>3 · Canlı durum</h2>
+    <div class="kv">
+      <div>Ses seviyesi</div><div><div class="meter"><div id="lvl"></div></div></div>
+      <div>Sinyal</div><div id="sig">—</div>
+      <div>Paket sayısı</div><div id="cnt">0</div>
+      <div>Son paket (UTC)</div><div id="last">—</div>
+      <div>Son konum</div><div id="pos">—</div>
+      <div>Son irtifa</div><div id="alt">—</div>
+    </div>
+
+    <h2>Son paketler</h2>
+    <table>
+      <thead><tr><th>UTC</th><th>Enlem</th><th>Boylam</th><th>Irtifa (m)</th></tr></thead>
+      <tbody id="tbl"></tbody>
+    </table>
+
+    <h2>Ham metin (son paket)</h2>
+    <div class="log" id="rawLog">—</div>
+  </div>
+
+  <div id="map"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="decoder.js"></script>
+<script>
+(function () {
+  const $ = id => document.getElementById(id);
+  let ctx = null, stream = null, node = null, decoder = null, running = false;
+  let packets = 0, lastPos = null, track = [], marker = null, line = null, lastLevelT = 0;
+
+  // ---- map ----
+  const map = L.map('map').setView([41.0, 29.0], 8);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 18, attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+  line = L.polyline([], { color: '#1f6feb', weight: 3 }).addTo(map);
+
+  function setHdr(text, on) {
+    $('hdrStatus').textContent = text;
+    $('dot').className = 'status-dot' + (on ? ' on' : '');
+  }
+
+  function onFrame(f) {
+    packets++;
+    $('cnt').textContent = packets;
+    $('last').textContent = `${f.utcDate} ${f.utcTime}`;
+    $('pos').textContent = `${f.lat.toFixed(6)}, ${f.lon.toFixed(6)}`;
+    $('alt').textContent = `${f.alt} m`;
+    $('rawLog').textContent = f.raw;
+    const ll = [f.lat, f.lon];
+    if (!marker) {
+      marker = L.marker(ll).addTo(map);
+      map.setView(ll, 13);
+    } else {
+      marker.setLatLng(ll);
+    }
+    marker.bindPopup(`<b>MTS-01</b><br>${f.utcDate} ${f.utcTime} UTC<br>${f.lat.toFixed(6)}, ${f.lon.toFixed(6)}<br>Irtifa: ${f.alt} m`);
+    track.push(ll);
+    line.setLatLngs(track);
+    lastPos = ll;
+
+    const tr = document.createElement('tr');
+    tr.className = 'latest';
+    tr.innerHTML = `<td>${f.utcTime}</td><td>${f.lat.toFixed(5)}</td><td>${f.lon.toFixed(5)}</td><td>${f.alt}</td>`;
+    const tb = $('tbl');
+    [...tb.querySelectorAll('tr.latest')].forEach(r => r.classList.remove('latest'));
+    tb.prepend(tr);
+    while (tb.children.length > 15) tb.removeChild(tb.lastChild);
+    if (packets === 1) setHdr('Paket alındı', true);
+  }
+
+  function onStatus(level) {
+    const pct = Math.min(100, Math.round(level * 400));
+    $('lvl').style.width = pct + '%';
+  }
+
+  // ---- AudioWorklet (inline, via Blob) ----
+  const workletSrc = `
+    class Tap extends AudioWorkletProcessor {
+      process(inputs) {
+        const ch = inputs[0] && inputs[0][0];
+        if (ch) this.port.postMessage(ch.slice(0));
+        return true;
+      }
+    }
+    registerProcessor('tap', Tap);`;
+
+  async function attachTap(audioCtx, source) {
+    const url = URL.createObjectURL(new Blob([workletSrc], { type: 'application/javascript' }));
+    await audioCtx.audioWorklet.addModule(url);
+    const tap = new AudioWorkletNode(audioCtx, 'tap', { numberOfOutputs: 0 });
+    tap.port.onmessage = e => {
+      if (!decoder) return;
+      decoder.push(e.data);
+      const now = performance.now();
+      if (now - lastLevelT > 150) { lastLevelT = now; onStatus(decoder.level); }
+      $('sig').textContent = decoder.level > 0.01 ? 'var (aktif)' : 'yok';
+    };
+    source.connect(tap);
+    return tap;
+  }
+
+  // ---- device list ----
+  async function listDevices() {
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+      s.getTracks().forEach(t => t.stop());
+    } catch (e) {
+      setHdr('Mikrofon izni verilmedi: ' + e.name, false);
+      return;
+    }
+    const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput');
+    const sel = $('devSel');
+    sel.innerHTML = '';
+    devs.forEach(d => {
+      const o = document.createElement('option');
+      o.value = d.deviceId;
+      o.textContent = d.label || '(isimsiz cihaz)';
+      if (/cable output/i.test(d.label)) o.selected = true;
+      sel.appendChild(o);
+    });
+    $('btnStart').disabled = false;
+    setHdr('Cihazlar listelendi', false);
+  }
+
+  async function start() {
+    if (running) return;
+    const deviceId = $('devSel').value;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { deviceId: deviceId ? { exact: deviceId } : undefined,
+                 echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+      });
+    } catch (e) { setHdr('Ses açılamadı: ' + e.name, false); return; }
+
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    await ctx.resume();
+    const src = ctx.createMediaStreamSource(stream);
+    decoder = new MtsDecoder.SondeDecoder(ctx.sampleRate, onFrame);
+    node = await attachTap(ctx, src);
+    running = true;
+    $('btnStart').disabled = true; $('btnStop').disabled = false;
+    setHdr(`Dinleniyor (${ctx.sampleRate} Hz)`, true);
+  }
+
+  function stop() {
+    running = false;
+    if (node) node.port.onmessage = null;
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    if (ctx) ctx.close();
+    stream = null; ctx = null; node = null; decoder = null;
+    $('btnStart').disabled = false; $('btnStop').disabled = true;
+    setHdr('Durduruldu', false);
+  }
+
+  // ---- WAV test mode ----
+  $('fileIn').addEventListener('change', async e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    stop();
+    setHdr('Dosya işleniyor…', false);
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    const audio = await ac.decodeAudioData(await file.arrayBuffer());
+    const data = audio.getChannelData(0);
+    decoder = new MtsDecoder.SondeDecoder(audio.sampleRate, onFrame);
+    for (let i = 0; i < data.length; i += 128) decoder.push(data.subarray(i, i + 128));
+    decoder = null;
+    setHdr(`Dosya bitti – ${packets} paket`, false);
+    ac.close();
+  });
+
+  $('btnPerm').addEventListener('click', listDevices);
+  $('btnStart').addEventListener('click', start);
+  $('btnStop').addEventListener('click', stop);
+  if (!navigator.mediaDevices || !window.isSecureContext) {
+    setHdr('Bu sayfayı http://localhost:8080 üzerinden açın (güvenli bağlam gerekli)', false);
+  }
+})();
+</script>
+</body>
+</html>
